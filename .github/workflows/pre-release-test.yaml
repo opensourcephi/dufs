@@ -1,0 +1,254 @@
+name: Pre-Release Test
+on:
+  workflow_dispatch:
+permissions:
+  contents: write
+env:
+  CARGO_BUILD_JOBS: 2
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.get-version.outputs.version }}
+      tag: ${{ steps.get-version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Get version and commit sha
+        id: get-version
+        run: |
+          ver=$(grep -m1 '^version' Cargo.toml | sed 's/version = "\(.*\)"/\1/')
+          sha=$(git rev-parse --short HEAD)
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
+          echo "tag=v${ver}-${sha}" >> "$GITHUB_OUTPUT"
+      - name: Push tag
+        run: |
+          git tag "${{ steps.get-version.outputs.tag }}" || echo "Tag already exists"
+          git push origin "${{ steps.get-version.outputs.tag }}"
+  build:
+    needs: prepare
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            use-cross: true
+            cargo-flags: ""
+            artifact-suffix: ""
+            shim: "0"
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            use-cross: true
+            cargo-flags: ""
+            artifact-suffix: ""
+            shim: "0"
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            use-cross: true
+            cargo-flags: ""
+            artifact-suffix: ""
+            shim: "0"
+          - target: aarch64-pc-windows-msvc
+            os: windows-latest
+            use-cross: true
+            cargo-flags: ""
+            artifact-suffix: ""
+            shim: "0"
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            cargo-flags: ""
+            artifact-suffix: ""
+            shim: "0"
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            cargo-flags: ""
+            artifact-suffix: ""
+            shim: "0"
+          - target: i686-pc-windows-msvc
+            os: windows-latest
+            use-cross: true
+            cargo-flags: ""
+            artifact-suffix: ""
+            shim: "0"
+          - target: armv7-linux-androideabi
+            os: ubuntu-latest
+            android: true
+            api: 19
+            artifact-suffix: "-android-19"
+            shim: "1"
+          - target: armv7-linux-androideabi
+            os: ubuntu-latest
+            android: true
+            api: 21
+            artifact-suffix: "-android-21"
+            shim: "1"
+          - target: aarch64-linux-android
+            os: ubuntu-latest
+            android: true
+            api: 21
+            artifact-suffix: "-android-21"
+            shim: "1"
+          - target: x86_64-linux-android
+            os: ubuntu-latest
+            android: true
+            api: 21
+            artifact-suffix: "-android-21"
+            shim: "1"
+    runs-on: ${{ matrix.os }}
+    env:
+      BUILD_CMD: cargo
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Rust (Android)
+        if: matrix.android
+        uses: moonrepo/setup-rust@v1.3.0
+        with:
+          cache: true
+          cache-base: main
+          cache-target: release
+          targets: ${{ matrix.target }}
+          bins: cargo-ndk
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Setup Rust (Non-Android)
+        if: "!matrix.android"
+        uses: moonrepo/setup-rust@v1.3.0
+        with:
+          cache: true
+          cache-base: main
+          cache-target: release
+          targets: ${{ matrix.target }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Setup Android SDK
+        if: matrix.android
+        uses: android-actions/setup-android@v3
+      - name: Install Android NDK r25
+        if: matrix.android
+        run: |
+          yes | "${ANDROID_SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager" --install "ndk;25.2.9519653"
+      - name: Set NDK environment
+        if: matrix.android
+        run: |
+          echo "ANDROID_NDK_HOME=${ANDROID_SDK_ROOT}/ndk/25.2.9519653" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_ROOT=${ANDROID_SDK_ROOT}/ndk/25.2.9519653" >> "$GITHUB_ENV"
+      - name: Prepare Android shim (for API < 24 where getifaddrs is missing)
+        if: matrix.shim == '1'
+        run: |
+          TARGET="${{ matrix.target }}"
+          case "$TARGET" in
+            aarch64-linux-android)    PREFIX=aarch64-linux-android ;;
+            armv7-linux-androideabi)  PREFIX=armv7a-linux-androideabi ;;
+            x86_64-linux-android)     PREFIX=x86_64-linux-android ;;
+            i686-linux-android)       PREFIX=i686-linux-android ;;
+            *) echo "Unsupported target"; exit 1 ;;
+          esac
+          NDK_BIN="$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          CLANG="${NDK_BIN}/${PREFIX}${{ matrix.api }}-clang"
+          cat > android-shim.c << 'EOF'
+          #include <fcntl.h>
+
+          #ifndef EPOLL_CLOEXEC
+          #define EPOLL_CLOEXEC 02000000
+          #endif
+
+          int epoll_create(int size);
+
+          int epoll_create1(int flags) {
+              int fd = epoll_create(1);
+              if (fd != -1 && (flags & EPOLL_CLOEXEC)) {
+                  int val = fcntl(fd, F_GETFD);
+                  if (val != -1) fcntl(fd, F_SETFD, val | FD_CLOEXEC);
+              }
+              return fd;
+          }
+
+          struct ifaddrs;
+          int getifaddrs(struct ifaddrs **ifap) {
+              *ifap = 0;
+              return 0;
+          }
+          void freeifaddrs(struct ifaddrs *ifa) {
+              (void)ifa;
+          }
+
+          typedef void (*sighandler_t)(int);
+          sighandler_t signal(int signum, sighandler_t handler) {
+              (void)signum;
+              return handler;
+          }
+
+          struct dl_phdr_info;
+          int dl_iterate_phdr(int (*callback)(struct dl_phdr_info *, size_t, void *), void *data) {
+              return 0;
+          }
+          EOF
+          "$CLANG" -c android-shim.c -o android-shim.o
+          "${NDK_BIN}/llvm-ar" rcs libandroid_shim.a android-shim.o
+          mkdir -p .cargo
+          echo "[target.${TARGET}]" >> .cargo/config.toml
+          echo "rustflags = [\"-C\", \"link-args=-L$(pwd) -landroid_shim\"]" >> .cargo/config.toml
+      - name: Install cross
+        if: matrix.use-cross && !matrix.android
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+      - name: Overwrite build command env variable
+        if: matrix.use-cross && !matrix.android
+        run: echo "BUILD_CMD=cross" >> "$GITHUB_ENV"
+      - name: Show Version Information
+        run: |
+          gcc --version || true
+          rustup -V
+          rustup toolchain list
+          rustup default
+          cargo -V
+          rustc -V
+      - name: Build (Android)
+        if: matrix.android
+        run: |
+          cargo ndk --target ${{ matrix.target }} --platform ${{ matrix.api }} -- build --locked --release
+      - name: Build (Non-Android)
+        if: "!matrix.android"
+        run: |
+          $BUILD_CMD build --locked --release --target=${{ matrix.target }} ${{ matrix.cargo-flags }}
+        shell: bash
+      - name: Build Archive
+        id: package
+        shell: bash
+        env:
+          target: ${{ matrix.target }}
+          suffix: ${{ matrix.artifact-suffix }}
+        run: |
+          set -euxo pipefail
+          bin="${GITHUB_REPOSITORY##*/}"
+          dist_dir="$(pwd)/dist"
+          name="${bin}-${target}${suffix}"
+          executable="target/${target}/release/${bin}"
+
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            executable="${executable}.exe"
+          fi
+
+          mkdir "$dist_dir"
+          cp "$executable" "$dist_dir"
+          cd "$dist_dir"
+
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            archive="${dist_dir}/${name}.zip"
+            7z a "$archive" ./*
+            echo "archive=dist/${name}.zip" >> "$GITHUB_OUTPUT"
+          else
+            archive="${dist_dir}/${name}.tar.gz"
+            tar -czf "$archive" ./*
+            echo "archive=dist/${name}.tar.gz" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Publish Archive
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          files: ${{ steps.package.outputs.archive }}
+          draft: false
+          prerelease: true
